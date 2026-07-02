@@ -1,50 +1,56 @@
 import React, { useEffect, useMemo, useState } from "react";
 import {
-  Cookie,
-  LogOut,
-  Plus,
-  Trash2,
-  RefreshCw,
-  Search,
-  CalendarDays,
-  Banknote,
-  ClipboardList,
-  PackageCheck,
-  Download,
-  Settings,
-  Save,
-  X,
-  CheckCircle2,
   AlertTriangle,
+  Banknote,
+  CalendarDays,
+  CheckCircle2,
+  ClipboardList,
+  Cookie,
+  Download,
+  LogOut,
+  PackageCheck,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Save,
+  Search,
+  Settings,
+  Trash2,
+  X,
 } from "lucide-react";
 import { supabase } from "./lib/supabase";
-import { peso, localDateString } from "./utils/currency";
-import CostingTab from "./components/CostingTab";
+import { localDateString, peso } from "./utils/currency";
 
 const starterFlavors = [
   {
     name: "Classic Chocolate Chip",
     prices: { 60: 0, 100: 100 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
   {
     name: "Red Velvet",
     prices: { 60: 65, 100: 0 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
   {
     name: "Oatmeal Cookie",
     prices: { 60: 65, 100: 0 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
   {
     name: "S'mores",
     prices: { 60: 110, 100: 0 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
   {
     name: "Stuffed Oreo",
     prices: { 60: 110, 100: 0 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
   {
     name: "Biscoff",
     prices: { 60: 0, 100: 0 },
+    resellerPrices: { 60: 0, 100: 0 },
   },
 ];
 
@@ -53,6 +59,7 @@ const emptyOrderForm = () => ({
   customer_contact: "",
   batch_date: localDateString(),
   order_type: "Pickup",
+  price_type: "Regular",
   amount_paid: "",
   notes: "",
   items: [],
@@ -83,6 +90,27 @@ function calculateOrder(order) {
   };
 }
 
+function normalizeFlavors(data = []) {
+  return data
+    .map((flavor) => {
+      const prices = { 60: 0, 100: 0 };
+      const resellerPrices = { 60: 0, 100: 0 };
+
+      (flavor.flavor_prices || []).forEach((row) => {
+        const size = Number(row.size_grams);
+        prices[size] = Number(row.price || 0);
+        resellerPrices[size] = Number(row.reseller_price || 0);
+      });
+
+      return {
+        ...flavor,
+        prices,
+        resellerPrices,
+      };
+    })
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
 function getFlavorName(item, flavors) {
   return (
     item.flavor_name_snapshot ||
@@ -92,20 +120,95 @@ function getFlavorName(item, flavors) {
   );
 }
 
-function normalizeFlavors(data = []) {
-  return data
-    .map((flavor) => {
-      const prices = { 60: 0, 100: 0 };
-      (flavor.flavor_prices || []).forEach((row) => {
-        prices[row.size_grams] = Number(row.price || 0);
-      });
+function getFlavorPrice(flavor, size, priceType = "Regular") {
+  const regularPrice = Number(flavor?.prices?.[size] || 0);
+  const resellerPrice = Number(flavor?.resellerPrices?.[size] || 0);
+
+  if (priceType === "Reseller" && resellerPrice > 0) {
+    return resellerPrice;
+  }
+
+  return regularPrice;
+}
+
+function getAvailableSizes(flavor) {
+  const sizes = [60, 100].filter((size) => {
+    const regular = Number(flavor?.prices?.[size] || 0);
+    const reseller = Number(flavor?.resellerPrices?.[size] || 0);
+    return regular > 0 || reseller > 0;
+  });
+
+  return sizes.length ? sizes : [60, 100];
+}
+
+function getDefaultFlavor(activeFlavors) {
+  return (
+    activeFlavors.find((flavor) =>
+      getAvailableSizes(flavor).some((size) => {
+        const regular = Number(flavor.prices?.[size] || 0);
+        const reseller = Number(flavor.resellerPrices?.[size] || 0);
+        return regular > 0 || reseller > 0;
+      })
+    ) || activeFlavors[0]
+  );
+}
+
+function createDefaultItem(activeFlavors, priceType = "Regular") {
+  const flavor = getDefaultFlavor(activeFlavors);
+  if (!flavor) return null;
+
+  const size = getAvailableSizes(flavor)[0] || 60;
+
+  return {
+    flavor_id: flavor.id,
+    size_grams: size,
+    quantity: 1,
+    price_each: getFlavorPrice(flavor, size, priceType),
+  };
+}
+
+function inferPriceTypeFromOrder(order, activeFlavors) {
+  const items = order.order_items || [];
+
+  const hasResellerMatch = items.some((item) => {
+    const flavor =
+      activeFlavors.find((row) => row.id === item.flavor_id) ||
+      activeFlavors.find((row) => row.name === item.flavor_name_snapshot);
+
+    if (!flavor) return false;
+
+    const resellerPrice = Number(flavor.resellerPrices?.[Number(item.size_grams)] || 0);
+    return resellerPrice > 0 && Number(item.price_each || 0) === resellerPrice;
+  });
+
+  return hasResellerMatch ? "Reseller" : "Regular";
+}
+
+function formFromOrder(order, activeFlavors) {
+  const fallbackItem = createDefaultItem(activeFlavors);
+  const inferredPriceType = inferPriceTypeFromOrder(order, activeFlavors);
+
+  return {
+    customer_name: order.customer_name || "",
+    customer_contact: order.customer_contact || "",
+    batch_date: order.batch_date || localDateString(),
+    order_type: order.order_type || "Pickup",
+    price_type: inferredPriceType,
+    amount_paid: order.amount_paid ?? "",
+    notes: order.notes || "",
+    items: (order.order_items || []).map((item) => {
+      const flavor =
+        activeFlavors.find((row) => row.id === item.flavor_id) ||
+        activeFlavors.find((row) => row.name === item.flavor_name_snapshot);
 
       return {
-        ...flavor,
-        prices,
+        flavor_id: flavor?.id || item.flavor_id || fallbackItem?.flavor_id || "",
+        size_grams: Number(item.size_grams || fallbackItem?.size_grams || 60),
+        quantity: Number(item.quantity || 1),
+        price_each: Number(item.price_each || 0),
       };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+    }),
+  };
 }
 
 function AuthPanel() {
@@ -120,24 +223,19 @@ function AuthPanel() {
     setBusy(true);
     setMessage("");
 
-let result;
+    const result =
+      mode === "signin"
+        ? await supabase.auth.signInWithPassword({
+            email: email.trim(),
+            password,
+          })
+        : await supabase.auth.signUp({
+            email: email.trim(),
+            password,
+          });
 
-if (mode === "signin") {
-  result = await supabase.auth.signInWithPassword({
-    email: email.trim(),
-    password,
-  });
-} else {
-  result = await supabase.auth.signUp({
-    email: email.trim(),
-    password,
-  });
-}
-
-const { error } = result;
-
-    if (error) {
-      setMessage(error.message);
+    if (result.error) {
+      setMessage(result.error.message);
     } else if (mode === "signup") {
       setMessage("Account created. Check your email if confirmation is enabled, then sign in.");
     }
@@ -159,7 +257,7 @@ const { error } = result;
         </div>
 
         <p className="auth-copy">
-          Track orders, payment, change, balance, and production count without using a calculator.
+          Track orders, payment, balance, and cookies to bake without using a calculator.
         </p>
 
         <form onSubmit={handleSubmit} className="auth-form">
@@ -229,6 +327,8 @@ function PriceManager({ flavors, onReload }) {
   const [newFlavor, setNewFlavor] = useState("");
   const [new60, setNew60] = useState("");
   const [new100, setNew100] = useState("");
+  const [new60Reseller, setNew60Reseller] = useState("");
+  const [new100Reseller, setNew100Reseller] = useState("");
   const [saving, setSaving] = useState(false);
   const [localPrices, setLocalPrices] = useState({});
 
@@ -239,8 +339,10 @@ function PriceManager({ flavors, onReload }) {
       initial[flavor.id] = {
         name: flavor.name,
         active: flavor.active,
-        60: flavor.prices[60] ?? 0,
-        100: flavor.prices[100] ?? 0,
+        60: flavor.prices?.[60] ?? 0,
+        100: flavor.prices?.[100] ?? 0,
+        reseller_60: flavor.resellerPrices?.[60] ?? 0,
+        reseller_100: flavor.resellerPrices?.[100] ?? 0,
       };
     });
 
@@ -264,21 +366,23 @@ function PriceManager({ flavors, onReload }) {
       if (flavorError) throw flavorError;
 
       for (const size of [60, 100]) {
-        const existing = flavor.flavor_prices?.find(
-          (row) => Number(row.size_grams) === size
-        );
-
+        const existing = flavor.flavor_prices?.find((row) => Number(row.size_grams) === size);
         const price = Number(local[size] || 0);
+        const resellerPrice = Number(local[`reseller_${size}`] || 0);
 
         const result = existing
           ? await supabase
               .from("flavor_prices")
-              .update({ price })
+              .update({
+                price,
+                reseller_price: resellerPrice,
+              })
               .eq("id", existing.id)
           : await supabase.from("flavor_prices").insert({
               flavor_id: flavor.id,
               size_grams: size,
               price,
+              reseller_price: resellerPrice,
             });
 
         if (result.error) throw result.error;
@@ -286,7 +390,7 @@ function PriceManager({ flavors, onReload }) {
 
       await onReload();
     } catch (error) {
-      alert(error.message || "Failed to save flavor.");
+      alert(error.message || "Failed to save flavor. Make sure reseller_price column exists in Supabase.");
     } finally {
       setSaving(false);
     }
@@ -294,7 +398,6 @@ function PriceManager({ flavors, onReload }) {
 
   async function addFlavor(event) {
     event.preventDefault();
-
     if (!newFlavor.trim()) return;
 
     setSaving(true);
@@ -316,11 +419,13 @@ function PriceManager({ flavors, onReload }) {
           flavor_id: flavor.id,
           size_grams: 60,
           price: Number(new60 || 0),
+          reseller_price: Number(new60Reseller || 0),
         },
         {
           flavor_id: flavor.id,
           size_grams: 100,
           price: Number(new100 || 0),
+          reseller_price: Number(new100Reseller || 0),
         },
       ]);
 
@@ -329,27 +434,23 @@ function PriceManager({ flavors, onReload }) {
       setNewFlavor("");
       setNew60("");
       setNew100("");
-
+      setNew60Reseller("");
+      setNew100Reseller("");
       await onReload();
     } catch (error) {
-      alert(error.message || "Failed to add flavor.");
+      alert(error.message || "Failed to add flavor. Make sure reseller_price column exists in Supabase.");
     } finally {
       setSaving(false);
     }
   }
 
   async function deleteFlavor(flavor) {
-    const confirmed = window.confirm(
-      `Delete ${flavor.name}? Only do this if it has no existing order items.`
-    );
-
+    const confirmed = window.confirm(`Delete ${flavor.name}? Only do this if it has no existing order items.`);
     if (!confirmed) return;
 
     try {
       const { error } = await supabase.from("flavors").delete().eq("id", flavor.id);
-
       if (error) throw error;
-
       await onReload();
     } catch (error) {
       alert(error.message || "Failed to delete flavor.");
@@ -358,11 +459,7 @@ function PriceManager({ flavors, onReload }) {
 
   if (!open) {
     return (
-      <button
-        className="secondary-btn manager-open-btn"
-        type="button"
-        onClick={() => setOpen(true)}
-      >
+      <button className="secondary-btn manager-open-btn" type="button" onClick={() => setOpen(true)}>
         <Settings size={16} />
         Manage flavors/prices
       </button>
@@ -377,12 +474,7 @@ function PriceManager({ flavors, onReload }) {
           <h2>Flavor & Price Manager</h2>
         </div>
 
-        <button
-          className="icon-btn"
-          type="button"
-          onClick={() => setOpen(false)}
-          aria-label="Close settings"
-        >
+        <button className="icon-btn" type="button" onClick={() => setOpen(false)} aria-label="Close settings">
           <X size={18} />
         </button>
       </div>
@@ -405,7 +497,7 @@ function PriceManager({ flavors, onReload }) {
             step="1"
             value={new60}
             onChange={(event) => setNew60(event.target.value)}
-            placeholder="60g price"
+            placeholder="Regular"
           />
         </label>
 
@@ -417,7 +509,31 @@ function PriceManager({ flavors, onReload }) {
             step="1"
             value={new100}
             onChange={(event) => setNew100(event.target.value)}
-            placeholder="100g price"
+            placeholder="Regular"
+          />
+        </label>
+
+        <label className="manager-field">
+          <span>60g reseller</span>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={new60Reseller}
+            onChange={(event) => setNew60Reseller(event.target.value)}
+            placeholder="Reseller"
+          />
+        </label>
+
+        <label className="manager-field">
+          <span>100g reseller</span>
+          <input
+            type="number"
+            min="0"
+            step="1"
+            value={new100Reseller}
+            onChange={(event) => setNew100Reseller(event.target.value)}
+            placeholder="Reseller"
           />
         </label>
 
@@ -432,6 +548,8 @@ function PriceManager({ flavors, onReload }) {
           <span>Flavor</span>
           <span>60g</span>
           <span>100g</span>
+          <span>60g reseller</span>
+          <span>100g reseller</span>
           <span>Active</span>
           <span>Actions</span>
         </div>
@@ -495,9 +613,46 @@ function PriceManager({ flavors, onReload }) {
                 />
               </label>
 
+              <label className="manager-price-field">
+                <span>60g reseller</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={local.reseller_60 ?? ""}
+                  onChange={(event) =>
+                    setLocalPrices((current) => ({
+                      ...current,
+                      [flavor.id]: {
+                        ...current[flavor.id],
+                        reseller_60: event.target.value,
+                      },
+                    }))
+                  }
+                />
+              </label>
+
+              <label className="manager-price-field">
+                <span>100g reseller</span>
+                <input
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={local.reseller_100 ?? ""}
+                  onChange={(event) =>
+                    setLocalPrices((current) => ({
+                      ...current,
+                      [flavor.id]: {
+                        ...current[flavor.id],
+                        reseller_100: event.target.value,
+                      },
+                    }))
+                  }
+                />
+              </label>
+
               <label className="manager-active-field">
                 <span>Active</span>
-
                 <div className="active-control">
                   <input
                     type="checkbox"
@@ -542,27 +697,39 @@ function PriceManager({ flavors, onReload }) {
     </section>
   );
 }
-function OrderForm({ flavors, onCreated }) {
+
+function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }) {
   const activeFlavors = flavors.filter((flavor) => flavor.active);
   const [form, setForm] = useState(emptyOrderForm());
   const [saving, setSaving] = useState(false);
+  const isEditing = Boolean(orderToEdit?.id);
 
   useEffect(() => {
-    if (activeFlavors.length && form.items.length === 0) {
-      const firstFlavor = activeFlavors[0];
-      setForm((current) => ({
-        ...current,
-        items: [
-          {
-            flavor_id: firstFlavor.id,
-            size_grams: 60,
-            quantity: 1,
-            price_each: firstFlavor.prices[60] ?? 0,
-          },
-        ],
-      }));
+    if (isEditing) {
+      const editForm = formFromOrder(orderToEdit, activeFlavors);
+      setForm({
+        ...editForm,
+        items: editForm.items.length ? editForm.items : [createDefaultItem(activeFlavors, editForm.price_type)].filter(Boolean),
+      });
+      return;
     }
-  }, [activeFlavors.length]);
+
+    const firstItem = createDefaultItem(activeFlavors, "Regular");
+    setForm({
+      ...emptyOrderForm(),
+      batch_date: defaultBatchDate || localDateString(),
+      items: firstItem ? [firstItem] : [],
+    });
+  }, [isEditing, orderToEdit?.id, activeFlavors.length, defaultBatchDate]);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.key === "Escape") onClose();
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   const draftTotal = useMemo(() => {
     return form.items.reduce((sum, item) => {
@@ -578,21 +745,31 @@ function OrderForm({ flavors, onCreated }) {
     setForm((current) => ({ ...current, [field]: value }));
   }
 
+  function updatePriceType(value) {
+    setForm((current) => {
+      const nextItems = current.items.map((item) => {
+        const flavor = activeFlavors.find((row) => row.id === item.flavor_id);
+        return {
+          ...item,
+          price_each: getFlavorPrice(flavor, Number(item.size_grams), value),
+        };
+      });
+
+      return {
+        ...current,
+        price_type: value,
+        items: nextItems,
+      };
+    });
+  }
+
   function addItem() {
-    const firstFlavor = activeFlavors[0];
-    if (!firstFlavor) return;
+    const item = createDefaultItem(activeFlavors, form.price_type);
+    if (!item) return;
 
     setForm((current) => ({
       ...current,
-      items: [
-        ...current.items,
-        {
-          flavor_id: firstFlavor.id,
-          size_grams: 60,
-          quantity: 1,
-          price_each: firstFlavor.prices[60] ?? 0,
-        },
-      ],
+      items: [...current.items, item],
     }));
   }
 
@@ -606,9 +783,18 @@ function OrderForm({ flavors, onCreated }) {
           [field]: value,
         };
 
-        if (field === "flavor_id" || field === "size_grams") {
+        if (field === "flavor_id") {
+          const flavor = activeFlavors.find((row) => row.id === value);
+          const sizes = getAvailableSizes(flavor);
+          const nextSize = sizes.includes(Number(updated.size_grams)) ? Number(updated.size_grams) : sizes[0] || 60;
+          updated.size_grams = nextSize;
+          updated.price_each = getFlavorPrice(flavor, nextSize, current.price_type);
+        }
+
+        if (field === "size_grams") {
           const flavor = activeFlavors.find((row) => row.id === updated.flavor_id);
-          updated.price_each = flavor?.prices[Number(updated.size_grams)] ?? 0;
+          updated.size_grams = Number(value);
+          updated.price_each = getFlavorPrice(flavor, Number(value), current.price_type);
         }
 
         return updated;
@@ -628,6 +814,26 @@ function OrderForm({ flavors, onCreated }) {
     }));
   }
 
+  async function saveItems(orderId) {
+    const rows = form.items.map((item) => {
+      const flavor = activeFlavors.find((row) => row.id === item.flavor_id) || flavors.find((row) => row.id === item.flavor_id);
+
+      return {
+        order_id: orderId,
+        flavor_id: item.flavor_id,
+        flavor_name_snapshot: flavor?.name || "Unknown flavor",
+        size_grams: Number(item.size_grams),
+        quantity: Number(item.quantity || 1),
+        price_each: Number(item.price_each || 0),
+      };
+    });
+
+    if (!rows.length) return;
+
+    const { error } = await supabase.from("order_items").insert(rows);
+    if (error) throw error;
+  }
+
   async function handleSubmit(event) {
     event.preventDefault();
 
@@ -638,220 +844,240 @@ function OrderForm({ flavors, onCreated }) {
 
     setSaving(true);
 
-    const { data: order, error: orderError } = await supabase
-      .from("orders")
-      .insert({
+    try {
+      const orderPayload = {
         customer_name: form.customer_name.trim(),
         customer_contact: form.customer_contact.trim() || null,
         batch_date: form.batch_date,
         order_type: form.order_type,
         amount_paid: Number(form.amount_paid || 0),
         notes: form.notes.trim() || null,
-      })
-      .select("*")
-      .single();
-
-    if (orderError) {
-      alert(orderError.message);
-      setSaving(false);
-      return;
-    }
-
-    const rows = form.items.map((item) => {
-      const flavor = activeFlavors.find((row) => row.id === item.flavor_id);
-      return {
-        order_id: order.id,
-        flavor_id: item.flavor_id,
-        flavor_name_snapshot: flavor?.name || "Unknown flavor",
-        size_grams: Number(item.size_grams),
-        quantity: Number(item.quantity || 1),
-        price_each: Number(item.price_each || 0),
       };
-    });
 
-    const { error: itemsError } = await supabase.from("order_items").insert(rows);
+      if (isEditing) {
+        const { error: updateError } = await supabase.from("orders").update(orderPayload).eq("id", orderToEdit.id);
+        if (updateError) throw updateError;
 
-    if (itemsError) {
-      alert(itemsError.message);
-      await supabase.from("orders").delete().eq("id", order.id);
+        const { error: deleteItemsError } = await supabase.from("order_items").delete().eq("order_id", orderToEdit.id);
+        if (deleteItemsError) throw deleteItemsError;
+
+        await saveItems(orderToEdit.id);
+      } else {
+        const { data: order, error: orderError } = await supabase.from("orders").insert(orderPayload).select("*").single();
+        if (orderError) throw orderError;
+
+        try {
+          await saveItems(order.id);
+        } catch (itemsError) {
+          await supabase.from("orders").delete().eq("id", order.id);
+          throw itemsError;
+        }
+      }
+
+      await onSaved();
+      onClose();
+    } catch (error) {
+      alert(error.message || "Failed to save order.");
+    } finally {
       setSaving(false);
-      return;
     }
-
-    setForm(emptyOrderForm());
-    await onCreated();
-    setSaving(false);
   }
 
   return (
-    <section className="card order-form-card">
-      <div className="panel-title-row">
-        <div>
-          <p className="eyebrow">New order</p>
-          <h2>Add customer order</h2>
-        </div>
-      </div>
-
-      <form onSubmit={handleSubmit} className="order-form">
-        <div className="form-grid">
-          <label>
-            Customer name
-            <input
-              required
-              value={form.customer_name}
-              onChange={(event) => updateField("customer_name", event.target.value)}
-              placeholder="Example: Claire"
-            />
-          </label>
-
-          <label>
-            Contact / note
-            <input
-              value={form.customer_contact}
-              onChange={(event) => updateField("customer_contact", event.target.value)}
-              placeholder="Optional"
-            />
-          </label>
-
-          <label>
-            Batch date
-            <input
-              type="date"
-              required
-              value={form.batch_date}
-              onChange={(event) => updateField("batch_date", event.target.value)}
-            />
-          </label>
-
-          <label>
-            Order type
-            <select
-              value={form.order_type}
-              onChange={(event) => updateField("order_type", event.target.value)}
-            >
-              <option>Pickup</option>
-              <option>Delivery</option>
-            </select>
-          </label>
-        </div>
-
-        <div className="items-area">
-          <div className="items-title-row">
-            <strong>Cookie items</strong>
-            <button type="button" className="secondary-btn small" onClick={addItem}>
-              <Plus size={14} />
-              Add item
-            </button>
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="modal-card order-modal" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <div>
+            <p className="eyebrow">{isEditing ? "Edit order" : "New order"}</p>
+            <h2>{isEditing ? "Update customer order" : "Add customer order"}</h2>
           </div>
 
-          {form.items.map((item, index) => (
-            <div className="item-row" key={`${item.flavor_id}-${index}`}>
-              <label>
-                Flavor
-                <select
-                  value={item.flavor_id}
-                  onChange={(event) => updateItem(index, "flavor_id", event.target.value)}
-                >
-                  {activeFlavors.map((flavor) => (
-                    <option value={flavor.id} key={flavor.id}>
-                      {flavor.name}
-                    </option>
-                  ))}
-                </select>
-              </label>
+          <button className="icon-btn" type="button" onClick={onClose} aria-label="Close order modal">
+            <X size={18} />
+          </button>
+        </div>
 
-              <label>
-                Size
-                <select
-                  value={item.size_grams}
-                  onChange={(event) => updateItem(index, "size_grams", Number(event.target.value))}
-                >
-                  <option value={60}>60g</option>
-                  <option value={100}>100g</option>
-                </select>
-              </label>
+        <form onSubmit={handleSubmit} className="order-form modal-form">
+          <div className="form-grid compact-form-grid">
+            <label>
+              Customer name
+              <input
+                required
+                value={form.customer_name}
+                onChange={(event) => updateField("customer_name", event.target.value)}
+                placeholder="Example: Claire"
+              />
+            </label>
 
-              <label>
-                Qty
-                <input
-                  type="number"
-                  min="1"
-                  step="1"
-                  value={item.quantity}
-                  onChange={(event) => updateItem(index, "quantity", event.target.value)}
-                />
-              </label>
+            <label>
+              Contact / note
+              <input
+                value={form.customer_contact}
+                onChange={(event) => updateField("customer_contact", event.target.value)}
+                placeholder="Optional"
+              />
+            </label>
 
+            <label>
+              Batch date
+              <input
+                type="date"
+                required
+                value={form.batch_date}
+                onChange={(event) => updateField("batch_date", event.target.value)}
+              />
+            </label>
+
+            <label>
+              Order type
+              <select value={form.order_type} onChange={(event) => updateField("order_type", event.target.value)}>
+                <option>Pickup</option>
+                <option>Delivery</option>
+              </select>
+            </label>
+
+            <label>
+              Price type
+              <select value={form.price_type} onChange={(event) => updatePriceType(event.target.value)}>
+                <option>Regular</option>
+                <option>Reseller</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="items-area">
+            <div className="items-title-row">
+              <strong>Cookie items</strong>
+              <button type="button" className="secondary-btn small add-item-btn" onClick={addItem} disabled={!activeFlavors.length}>
+                <Plus size={14} />
+                Add item
+              </button>
+            </div>
+
+            {form.items.map((item, index) => {
+              const selectedFlavor = activeFlavors.find((flavor) => flavor.id === item.flavor_id) || activeFlavors[0];
+              const availableSizes = getAvailableSizes(selectedFlavor);
+
+              return (
+                <div className="item-row" key={`${item.flavor_id}-${index}`}>
+                  <label>
+                    Flavor
+                    <select value={item.flavor_id} onChange={(event) => updateItem(index, "flavor_id", event.target.value)}>
+                      {activeFlavors.map((flavor) => (
+                        <option value={flavor.id} key={flavor.id}>
+                          {flavor.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label>
+                    Size
+                    <select
+                      value={item.size_grams}
+                      onChange={(event) => updateItem(index, "size_grams", Number(event.target.value))}
+                    >
+                      {[60, 100].map((size) => {
+                        const displayPrice = getFlavorPrice(selectedFlavor, size, form.price_type);
+
+                        return (
+                          <option value={size} key={size} disabled={!availableSizes.includes(size)}>
+                            {size}g{displayPrice ? ` - ${peso(displayPrice)}` : ""}
+                          </option>
+                        );
+                      })}
+                    </select>
+                  </label>
+
+                  <label>
+                    Qty
+                    <input
+                      type="number"
+                      min="1"
+                      step="1"
+                      value={item.quantity}
+                      onChange={(event) => updateItem(index, "quantity", event.target.value)}
+                    />
+                  </label>
+
+                  <label>
+                    Price each
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={item.price_each}
+                      onChange={(event) => updateItem(index, "price_each", event.target.value)}
+                    />
+                  </label>
+
+                  <div className="line-total">
+                    <span>Line total</span>
+                    <strong>{peso(Number(item.quantity || 0) * Number(item.price_each || 0))}</strong>
+                  </div>
+
+                  <button type="button" className="icon-btn danger" onClick={() => removeItem(index)} aria-label="Remove item">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="payment-grid">
+            <div className="paid-field">
               <label>
-                Price each
+                Amount paid
                 <input
                   type="number"
                   min="0"
                   step="1"
-                  value={item.price_each}
-                  onChange={(event) => updateItem(index, "price_each", event.target.value)}
+                  value={form.amount_paid}
+                  onChange={(event) => updateField("amount_paid", event.target.value)}
+                  placeholder="0"
                 />
               </label>
 
-              <div className="line-total">
-                <span>Line total</span>
-                <strong>{peso(Number(item.quantity || 0) * Number(item.price_each || 0))}</strong>
-              </div>
-
-              <button type="button" className="icon-btn danger" onClick={() => removeItem(index)}>
-                <Trash2 size={16} />
+              <button type="button" className="secondary-btn small" onClick={() => updateField("amount_paid", draftTotal)}>
+                Mark as fully paid
               </button>
             </div>
-          ))}
-        </div>
 
-        <div className="payment-grid">
-          <label>
-            Amount paid
-            <input
-              type="number"
-              min="0"
-              step="1"
-              value={form.amount_paid}
-              onChange={(event) => updateField("amount_paid", event.target.value)}
-              placeholder="0"
-            />
-          </label>
+            <label className="wide">
+              Notes
+              <input
+                value={form.notes}
+                onChange={(event) => updateField("notes", event.target.value)}
+                placeholder="Example: Paid via GCash, reseller order, pickup tomorrow"
+              />
+            </label>
+          </div>
 
-          <label className="wide">
-            Notes
-            <input
-              value={form.notes}
-              onChange={(event) => updateField("notes", event.target.value)}
-              placeholder="Example: Paid via GCash, pickup tomorrow"
-            />
-          </label>
-        </div>
-
-        <div className="checkout-strip">
-          <div>
-            <span>Total</span>
-            <strong>{peso(draftTotal)}</strong>
+          <div className="checkout-strip modal-checkout-strip">
+            <div>
+              <span>Total</span>
+              <strong>{peso(draftTotal)}</strong>
+            </div>
+            <div>
+              <span>Paid</span>
+              <strong>{peso(draftPaid)}</strong>
+            </div>
+            <div className={draftBalance > 0 ? "bad" : ""}>
+              <span>Balance</span>
+              <strong>{peso(draftBalance)}</strong>
+            </div>
+            <div className={draftChange > 0 ? "good" : ""}>
+              <span>Change</span>
+              <strong>{peso(draftChange)}</strong>
+            </div>
+            <button className="primary-btn" disabled={saving || !activeFlavors.length}>
+              <Save size={16} />
+              {saving ? "Saving..." : isEditing ? "Save changes" : "Save order"}
+            </button>
           </div>
-          <div>
-            <span>Paid</span>
-            <strong>{peso(draftPaid)}</strong>
-          </div>
-          <div className={draftBalance > 0 ? "bad" : ""}>
-            <span>Balance</span>
-            <strong>{peso(draftBalance)}</strong>
-          </div>
-          <div className={draftChange > 0 ? "good" : ""}>
-            <span>Change</span>
-            <strong>{peso(draftChange)}</strong>
-          </div>
-          <button className="primary-btn" disabled={saving || !activeFlavors.length}>
-            <Save size={16} />
-            {saving ? "Saving..." : "Save order"}
-          </button>
-        </div>
-      </form>
-    </section>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -861,7 +1087,7 @@ function ProductionSummary({ summary }) {
       <div className="panel-title-row">
         <div>
           <p className="eyebrow">Baking prep</p>
-          <h2>Production Summary</h2>
+          <h2>Cookies to Bake</h2>
         </div>
       </div>
 
@@ -874,7 +1100,6 @@ function ProductionSummary({ summary }) {
               <span>{row.size}g</span>
               <strong>{row.quantity} pcs</strong>
               <p>{row.flavor}</p>
-              <small>{peso(row.revenue)} projected sales</small>
             </div>
           ))}
         </div>
@@ -883,7 +1108,7 @@ function ProductionSummary({ summary }) {
   );
 }
 
-function OrderList({ orders, flavors, onReload }) {
+function OrderList({ orders, flavors, onReload, onEdit }) {
   async function deleteOrder(orderId) {
     const confirmed = window.confirm("Delete this order?");
     if (!confirmed) return;
@@ -894,17 +1119,13 @@ function OrderList({ orders, flavors, onReload }) {
   }
 
   async function markPaid(order) {
-    const { error } = await supabase
-      .from("orders")
-      .update({ amount_paid: order.computed_total })
-      .eq("id", order.id);
-
+    const { error } = await supabase.from("orders").update({ amount_paid: order.computed_total }).eq("id", order.id);
     if (error) alert(error.message);
     await onReload();
   }
 
   return (
-    <section className="card">
+    <section className="card orders-card">
       <div className="panel-title-row">
         <div>
           <p className="eyebrow">Order list</p>
@@ -923,11 +1144,7 @@ function OrderList({ orders, flavors, onReload }) {
                   <div className="customer-line">
                     <strong>{order.customer_name}</strong>
                     <span className={`status ${order.computed_status.toLowerCase().replace(" ", "-")}`}>
-                      {order.computed_status === "Paid" ? (
-                        <CheckCircle2 size={13} />
-                      ) : (
-                        <AlertTriangle size={13} />
-                      )}
+                      {order.computed_status === "Paid" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
                       {order.computed_status}
                     </span>
                   </div>
@@ -948,8 +1165,7 @@ function OrderList({ orders, flavors, onReload }) {
               <div className="order-items">
                 {order.order_items?.map((item) => (
                   <span key={item.id}>
-                    {item.quantity}x {getFlavorName(item, flavors)} {item.size_grams}g @{" "}
-                    {peso(item.price_each)}
+                    {item.quantity}x {getFlavorName(item, flavors)} {item.size_grams}g @ {peso(item.price_each)}
                   </span>
                 ))}
               </div>
@@ -957,12 +1173,18 @@ function OrderList({ orders, flavors, onReload }) {
               {order.notes && <p className="order-notes">{order.notes}</p>}
 
               <div className="order-actions">
+                <button className="secondary-btn small" type="button" onClick={() => onEdit(order)}>
+                  <Pencil size={14} />
+                  Edit
+                </button>
+
                 {order.computed_status !== "Paid" && (
-                  <button className="secondary-btn small" onClick={() => markPaid(order)}>
+                  <button className="secondary-btn small" type="button" onClick={() => markPaid(order)}>
                     Mark paid
                   </button>
                 )}
-                <button className="icon-btn danger" onClick={() => deleteOrder(order.id)}>
+
+                <button className="icon-btn danger" type="button" onClick={() => deleteOrder(order.id)} aria-label="Delete order">
                   <Trash2 size={16} />
                 </button>
               </div>
@@ -975,27 +1197,14 @@ function OrderList({ orders, flavors, onReload }) {
 }
 
 function exportCsv(orders, flavors) {
-  const headers = [
-    "Customer",
-    "Batch Date",
-    "Type",
-    "Items",
-    "Total",
-    "Paid",
-    "Balance",
-    "Change",
-    "Status",
-    "Notes",
-  ];
+  const headers = ["Customer", "Batch Date", "Type", "Items", "Total", "Paid", "Balance", "Change", "Status", "Notes"];
 
   const rows = orders.map((order) => [
     order.customer_name,
     order.batch_date,
     order.order_type,
     (order.order_items || [])
-      .map((item) => {
-        return `${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g @ ${item.price_each}`;
-      })
+      .map((item) => `${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g @ ${item.price_each}`)
       .join(" | "),
     order.computed_total,
     order.computed_paid,
@@ -1032,7 +1241,8 @@ function Dashboard({ session }) {
   const [batchDate, setBatchDate] = useState(localDateString());
   const [status, setStatus] = useState("All");
   const [query, setQuery] = useState("");
-  const [activeTab, setActiveTab] = useState("orders");
+  const [isOrderModalOpen, setIsOrderModalOpen] = useState(false);
+  const [editingOrder, setEditingOrder] = useState(null);
 
   async function ensureStarterFlavors() {
     const { data, error } = await supabase.from("flavors").select("id").limit(1);
@@ -1052,7 +1262,8 @@ function Dashboard({ session }) {
       return [60, 100].map((size) => ({
         flavor_id: flavor.id,
         size_grams: size,
-        price: starter?.prices[size] ?? 0,
+        price: starter?.prices?.[size] ?? 0,
+        reseller_price: starter?.resellerPrices?.[size] ?? 0,
       }));
     });
 
@@ -1066,18 +1277,14 @@ function Dashboard({ session }) {
     try {
       await ensureStarterFlavors();
 
-      const [{ data: flavorData, error: flavorError }, { data: orderData, error: orderError }] =
-        await Promise.all([
-          supabase
-            .from("flavors")
-            .select("*, flavor_prices(*)")
-            .order("name", { ascending: true }),
-          supabase
-            .from("orders")
-            .select("*, order_items(*, flavors(name))")
-            .order("batch_date", { ascending: false })
-            .order("created_at", { ascending: false }),
-        ]);
+      const [{ data: flavorData, error: flavorError }, { data: orderData, error: orderError }] = await Promise.all([
+        supabase.from("flavors").select("*, flavor_prices(*)").order("name", { ascending: true }),
+        supabase
+          .from("orders")
+          .select("*, order_items(*, flavors(name))")
+          .order("batch_date", { ascending: false })
+          .order("created_at", { ascending: false }),
+      ]);
 
       if (flavorError) throw flavorError;
       if (orderError) throw orderError;
@@ -1085,7 +1292,7 @@ function Dashboard({ session }) {
       setFlavors(normalizeFlavors(flavorData || []));
       setOrders((orderData || []).map(calculateOrder));
     } catch (error) {
-      alert(error.message);
+      alert(error.message || "Failed to load dashboard.");
     } finally {
       setLoading(false);
     }
@@ -1127,10 +1334,7 @@ function Dashboard({ session }) {
         acc.paid += order.computed_paid;
         acc.balance += order.computed_balance;
         acc.change += order.computed_change;
-        acc.pieces += (order.order_items || []).reduce(
-          (sum, item) => sum + Number(item.quantity || 0),
-          0
-        );
+        acc.pieces += (order.order_items || []).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
         return acc;
       },
       {
@@ -1155,11 +1359,9 @@ function Dashboard({ session }) {
           flavor,
           size: item.size_grams,
           quantity: 0,
-          revenue: 0,
         };
 
         current.quantity += Number(item.quantity || 0);
-        current.revenue += Number(item.quantity || 0) * Number(item.price_each || 0);
         map.set(key, current);
       });
     });
@@ -1170,6 +1372,21 @@ function Dashboard({ session }) {
       return a.size - b.size;
     });
   }, [filteredOrders, flavors]);
+
+  function openAddOrder() {
+    setEditingOrder(null);
+    setIsOrderModalOpen(true);
+  }
+
+  function openEditOrder(order) {
+    setEditingOrder(order);
+    setIsOrderModalOpen(true);
+  }
+
+  function closeOrderModal() {
+    setIsOrderModalOpen(false);
+    setEditingOrder(null);
+  }
 
   if (loading) {
     return (
@@ -1194,11 +1411,11 @@ function Dashboard({ session }) {
         </div>
 
         <div className="topbar-actions">
-          <button className="secondary-btn" onClick={loadData}>
+          <button className="secondary-btn" type="button" onClick={loadData}>
             <RefreshCw size={16} />
             Refresh
           </button>
-          <button className="ghost-btn" onClick={() => supabase.auth.signOut()}>
+          <button className="ghost-btn" type="button" onClick={() => supabase.auth.signOut()}>
             <LogOut size={16} />
             Sign out
           </button>
@@ -1206,14 +1423,11 @@ function Dashboard({ session }) {
       </header>
 
       <main>
-        <section className="hero-card">
+        <section className="hero-card compact-hero-card">
           <div>
             <p className="eyebrow">Batch control</p>
-            <h2>Butterhaus cookies</h2>
-            <p>
-              Add orders once, then see production count, sales, paid amount, balance, and change
-              instantly.
-            </p>
+            <h2>Butterhaus orders</h2>
+            <p>Add, edit, and track customer orders in one simple mobile-friendly dashboard.</p>
           </div>
           <div className="hero-pill">
             Logged in as <strong>{session.user.email}</strong>
@@ -1241,82 +1455,65 @@ function Dashboard({ session }) {
           <label className="filter-field search-field">
             <Search size={16} />
             Search
-            <input
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Name, flavor, notes..."
-            />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Name, flavor, notes..." />
           </label>
 
-          <button className="secondary-btn" onClick={() => exportCsv(filteredOrders, flavors)}>
+          <button className="secondary-btn" type="button" onClick={() => exportCsv(filteredOrders, flavors)}>
             <Download size={16} />
             Export CSV
           </button>
 
-          <button className="ghost-btn" onClick={() => setBatchDate("")}>
+          <button className="ghost-btn" type="button" onClick={() => setBatchDate("")}>
             All dates
           </button>
         </section>
 
         <section className="stats-grid">
           <StatCard icon={ClipboardList} label="Orders" value={stats.orders} detail="filtered batch" />
-          <StatCard icon={PackageCheck} label="Pieces" value={stats.pieces} detail="cookies to make" />
-          <StatCard icon={Banknote} label="Sales" value={peso(stats.sales)} detail={`Paid ${peso(stats.paid)}`} />
+          <StatCard icon={PackageCheck} label="Cookies" value={`${stats.pieces} pcs`} detail="to bake" />
+          <StatCard icon={Banknote} label="Paid" value={peso(stats.paid)} detail={`Sales ${peso(stats.sales)}`} />
           <StatCard icon={AlertTriangle} label="Balance" value={peso(stats.balance)} detail={`Change ${peso(stats.change)}`} />
         </section>
 
- <section className="app-tabs">
-  <button
-    type="button"
-    className={activeTab === "orders" ? "active" : ""}
-    onClick={() => setActiveTab("orders")}
-  >
-    Orders
-  </button>
-
-  <button
-    type="button"
-    className={activeTab === "costing" ? "active" : ""}
-    onClick={() => setActiveTab("costing")}
-  >
-    Costing / Profit
-  </button>
-</section>
-
-{activeTab === "orders" ? (
-  <>
-    <PriceManager flavors={flavors} onReload={loadData} />
-
-    <div className="dashboard-grid">
-      <div className="left-column">
-        <OrderForm flavors={flavors} onCreated={loadData} />
-        <OrderList orders={filteredOrders} flavors={flavors} onReload={loadData} />
-      </div>
-
-      <div className="right-column">
-        <ProductionSummary summary={productionSummary} />
-
-        <section className="card tips-card">
-          <p className="eyebrow">Workflow tip</p>
-          <h2>Best daily use</h2>
-          <ol>
-            <li>Set the batch date first.</li>
-            <li>Add all orders for that baking batch.</li>
-            <li>Check Production Summary before baking.</li>
-            <li>Use Customers & Payments to prepare change/balance.</li>
-          </ol>
+        <section className="quick-actions-card">
+          <button className="primary-btn add-order-main-btn" type="button" onClick={openAddOrder}>
+            <Plus size={18} />
+            Add Order
+          </button>
+          <PriceManager flavors={flavors} onReload={loadData} />
         </section>
-      </div>
-    </div>
-  </>
-) : (
-  <CostingTab
-    flavors={flavors}
-    filteredOrders={filteredOrders}
-    batchDate={batchDate}
-  />
-)}
+
+        <div className="dashboard-grid simplified-dashboard-grid">
+          <div className="left-column">
+            <OrderList orders={filteredOrders} flavors={flavors} onReload={loadData} onEdit={openEditOrder} />
+          </div>
+
+          <div className="right-column">
+            <ProductionSummary summary={productionSummary} />
+
+            <section className="card tips-card">
+              <p className="eyebrow">Workflow tip</p>
+              <h2>Best daily use</h2>
+              <ol>
+                <li>Set the batch date first.</li>
+                <li>Tap Add Order for every customer.</li>
+                <li>Use Edit if may mali or may dagdag order.</li>
+                <li>Check Cookies to Bake before baking.</li>
+              </ol>
+            </section>
+          </div>
+        </div>
       </main>
+
+      {isOrderModalOpen && (
+        <OrderModal
+          flavors={flavors}
+          orderToEdit={editingOrder}
+          defaultBatchDate={batchDate || localDateString()}
+          onClose={closeOrderModal}
+          onSaved={loadData}
+        />
+      )}
     </div>
   );
 }
