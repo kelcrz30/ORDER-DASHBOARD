@@ -211,6 +211,38 @@ function formFromOrder(order, activeFlavors) {
   };
 }
 
+// ---- NEW: builds a plain-text order summary for pasting into Messenger ----
+function buildOrderSummaryText(order, flavors) {
+  const lines = [];
+  lines.push("Butterhaus Order Summary");
+  lines.push("");
+  lines.push(`Customer: ${order.customer_name}`);
+  lines.push(`Batch Date: ${order.batch_date}`);
+  lines.push(`Type: ${order.order_type}`);
+  lines.push("");
+
+  (order.order_items || []).forEach((item) => {
+    const lineTotal = Number(item.quantity || 0) * Number(item.price_each || 0);
+    lines.push(`${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g - ${peso(lineTotal)}`);
+  });
+
+  lines.push("");
+  lines.push(`Total: ${peso(order.computed_total)}`);
+  lines.push(`Paid: ${peso(order.computed_paid)}`);
+  if (order.computed_balance > 0) lines.push(`Balance: ${peso(order.computed_balance)}`);
+  if (order.computed_change > 0) lines.push(`Change: ${peso(order.computed_change)}`);
+
+  if (order.notes) {
+    lines.push("");
+    lines.push(`Note: ${order.notes}`);
+  }
+
+  lines.push("");
+  lines.push("Thank u so much for purchasing! 🍪");
+
+  return lines.join("\n");
+}
+
 function AuthPanel() {
   const [mode, setMode] = useState("signin");
   const [email, setEmail] = useState("");
@@ -1109,6 +1141,8 @@ function ProductionSummary({ summary }) {
 }
 
 function OrderList({ orders, flavors, onReload, onEdit }) {
+  const [copiedOrderId, setCopiedOrderId] = useState(null);
+
   async function deleteOrder(orderId) {
     const confirmed = window.confirm("Delete this order?");
     if (!confirmed) return;
@@ -1122,6 +1156,20 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
     const { error } = await supabase.from("orders").update({ amount_paid: order.computed_total }).eq("id", order.id);
     if (error) alert(error.message);
     await onReload();
+  }
+
+  async function copySummary(order) {
+    const text = buildOrderSummaryText(order, flavors);
+
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedOrderId(order.id);
+      setTimeout(() => {
+        setCopiedOrderId((current) => (current === order.id ? null : current));
+      }, 2000);
+    } catch (error) {
+      alert("Hindi ma-copy. Subukan ulit.");
+    }
   }
 
   return (
@@ -1173,6 +1221,11 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
               {order.notes && <p className="order-notes">{order.notes}</p>}
 
               <div className="order-actions">
+                <button className="secondary-btn small" type="button" onClick={() => copySummary(order)}>
+                  <ClipboardList size={14} />
+                  {copiedOrderId === order.id ? "Copied!" : "Copy summary"}
+                </button>
+
                 <button className="secondary-btn small" type="button" onClick={() => onEdit(order)}>
                   <Pencil size={14} />
                   Edit
@@ -1463,6 +1516,10 @@ function Dashboard({ session }) {
             Export CSV
           </button>
 
+          <button className="ghost-btn" type="button" onClick={() => setBatchDate(localDateString())}>
+            Today
+          </button>
+
           <button className="ghost-btn" type="button" onClick={() => setBatchDate("")}>
             All dates
           </button>
@@ -1504,6 +1561,11 @@ function Dashboard({ session }) {
           </div>
         </div>
       </main>
+
+      {/* Floating Add Order button - always reachable while scrolling */}
+      <button className="fab-add-order" type="button" onClick={openAddOrder} aria-label="Add order">
+        <Plus size={24} />
+      </button>
 
       {isOrderModalOpen && (
         <OrderModal
