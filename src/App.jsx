@@ -54,12 +54,112 @@ const starterFlavors = [
   },
 ];
 
+const ASSORTED_BOXES = {
+  60: {
+    name: "Assorted Box of 6 - 60g",
+    price: 380,
+    size: 60,
+  },
+  100: {
+    name: "Assorted Box of 6 - 100g",
+    price: 640,
+    size: 100,
+  },
+};
+
+const ASSORTED_FLAVOR_NAMES = [
+  "Classic Chocolate Chip",
+  "Red Velvet",
+  "Oatmeal Cookie",
+  "S'mores",
+  "Stuffed Oreo",
+  "Biscoff",
+];
+
+function normalizeName(value = "") {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function createBundleId() {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+
+  return `box-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function createAssortedBoxItems(activeFlavors, size) {
+  const selectedBox = ASSORTED_BOXES[size];
+  if (!selectedBox) {
+    return { boxItems: [], missingFlavors: [], error: "Invalid assorted box size." };
+  }
+
+  const bundleId = createBundleId();
+  const missingFlavors = [];
+
+  const boxItems = ASSORTED_FLAVOR_NAMES
+    .map((flavorName, index) => {
+      const flavor = activeFlavors.find((row) => normalizeName(row.name) === normalizeName(flavorName));
+
+      if (!flavor) {
+        missingFlavors.push(flavorName);
+        return null;
+      }
+
+      return {
+        flavor_id: flavor.id,
+        size_grams: selectedBox.size,
+        quantity: 1,
+        // First row carries the full box price. The other five rows stay at 0
+        // but are still counted correctly in Cookies to Bake.
+        price_each: index === 0 ? selectedBox.price : 0,
+        bundle_id: bundleId,
+        bundle_name: selectedBox.name,
+      };
+    })
+    .filter(Boolean);
+
+  return { boxItems, missingFlavors, error: null };
+}
+
+function groupOrderItemsForDisplay(order, flavors) {
+  const grouped = [];
+  const bundleMap = new Map();
+
+  (order.order_items || []).forEach((item) => {
+    if (item.bundle_id && item.bundle_name) {
+      const existing = bundleMap.get(item.bundle_id) || {
+        type: "bundle",
+        key: item.bundle_id,
+        name: item.bundle_name,
+        quantity: 1,
+        total: 0,
+        flavors: [],
+      };
+
+      existing.total += Number(item.quantity || 0) * Number(item.price_each || 0);
+      existing.flavors.push(`${getFlavorName(item, flavors)} ${item.size_grams}g`);
+      bundleMap.set(item.bundle_id, existing);
+      return;
+    }
+
+    grouped.push({
+      type: "single",
+      key: item.id || `${item.flavor_id}-${item.size_grams}-${grouped.length}`,
+      item,
+    });
+  });
+
+  return [...bundleMap.values(), ...grouped];
+}
+
 const emptyOrderForm = () => ({
   customer_name: "",
   customer_contact: "",
   batch_date: localDateString(),
   order_type: "Pickup",
   price_type: "Regular",
+  fulfillment_status: "Pending",
   amount_paid: "",
   notes: "",
   items: [],
@@ -80,6 +180,8 @@ function calculateOrder(order) {
   else if (paid >= total) status = "Paid";
   else if (paid > 0) status = "Partial";
 
+  const prepStatus = order.fulfillment_status || "Pending";
+
   return {
     ...order,
     computed_total: total,
@@ -87,6 +189,8 @@ function calculateOrder(order) {
     computed_balance: balance,
     computed_change: change,
     computed_status: status,
+    computed_prep_status: prepStatus,
+    computed_is_done: prepStatus === "Done",
   };
 }
 
@@ -164,6 +268,8 @@ function createDefaultItem(activeFlavors, priceType = "Regular") {
     size_grams: size,
     quantity: 1,
     price_each: getFlavorPrice(flavor, size, priceType),
+    bundle_id: null,
+    bundle_name: null,
   };
 }
 
@@ -194,6 +300,7 @@ function formFromOrder(order, activeFlavors) {
     batch_date: order.batch_date || localDateString(),
     order_type: order.order_type || "Pickup",
     price_type: inferredPriceType,
+    fulfillment_status: order.fulfillment_status || "Pending",
     amount_paid: order.amount_paid ?? "",
     notes: order.notes || "",
     items: (order.order_items || []).map((item) => {
@@ -206,6 +313,8 @@ function formFromOrder(order, activeFlavors) {
         size_grams: Number(item.size_grams || fallbackItem?.size_grams || 60),
         quantity: Number(item.quantity || 1),
         price_each: Number(item.price_each || 0),
+        bundle_id: item.bundle_id || null,
+        bundle_name: item.bundle_name || null,
       };
     }),
   };
@@ -219,9 +328,17 @@ function buildOrderSummaryText(order, flavors) {
   lines.push(`Customer: ${order.customer_name}`);
   lines.push(`Batch Date: ${order.batch_date}`);
   lines.push(`Type: ${order.order_type}`);
+  lines.push(`Prep Status: ${order.computed_prep_status || order.fulfillment_status || "Pending"}`);
   lines.push("");
 
-  (order.order_items || []).forEach((item) => {
+  groupOrderItemsForDisplay(order, flavors).forEach((row) => {
+    if (row.type === "bundle") {
+      lines.push(`${row.quantity}x ${row.name} - ${peso(row.total)}`);
+      lines.push(`Includes: ${row.flavors.join(", ")}`);
+      return;
+    }
+
+    const item = row.item;
     const lineTotal = Number(item.quantity || 0) * Number(item.price_each || 0);
     lines.push(`${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g - ${peso(lineTotal)}`);
   });
@@ -780,6 +897,8 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
   function updatePriceType(value) {
     setForm((current) => {
       const nextItems = current.items.map((item) => {
+        if (item.bundle_id) return item;
+
         const flavor = activeFlavors.find((row) => row.id === item.flavor_id);
         return {
           ...item,
@@ -805,6 +924,25 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
     }));
   }
 
+  function addAssortedBox(size) {
+    const { boxItems, missingFlavors, error } = createAssortedBoxItems(activeFlavors, size);
+
+    if (error) {
+      alert(error);
+      return;
+    }
+
+    if (missingFlavors.length) {
+      alert(`Missing active flavors for box: ${missingFlavors.join(", ")}`);
+      return;
+    }
+
+    setForm((current) => ({
+      ...current,
+      items: [...current.items, ...boxItems],
+    }));
+  }
+
   function updateItem(index, field, value) {
     setForm((current) => {
       const nextItems = current.items.map((item, itemIndex) => {
@@ -816,14 +954,16 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
         };
 
         if (field === "flavor_id") {
-          const flavor = activeFlavors.find((row) => row.id === value);
-          const sizes = getAvailableSizes(flavor);
-          const nextSize = sizes.includes(Number(updated.size_grams)) ? Number(updated.size_grams) : sizes[0] || 60;
-          updated.size_grams = nextSize;
-          updated.price_each = getFlavorPrice(flavor, nextSize, current.price_type);
+          if (!updated.bundle_id) {
+            const flavor = activeFlavors.find((row) => row.id === value);
+            const sizes = getAvailableSizes(flavor);
+            const nextSize = sizes.includes(Number(updated.size_grams)) ? Number(updated.size_grams) : sizes[0] || 60;
+            updated.size_grams = nextSize;
+            updated.price_each = getFlavorPrice(flavor, nextSize, current.price_type);
+          }
         }
 
-        if (field === "size_grams") {
+        if (field === "size_grams" && !updated.bundle_id) {
           const flavor = activeFlavors.find((row) => row.id === updated.flavor_id);
           updated.size_grams = Number(value);
           updated.price_each = getFlavorPrice(flavor, Number(value), current.price_type);
@@ -840,10 +980,21 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
   }
 
   function removeItem(index) {
-    setForm((current) => ({
-      ...current,
-      items: current.items.filter((_, itemIndex) => itemIndex !== index),
-    }));
+    setForm((current) => {
+      const target = current.items[index];
+
+      if (target?.bundle_id) {
+        return {
+          ...current,
+          items: current.items.filter((item) => item.bundle_id !== target.bundle_id),
+        };
+      }
+
+      return {
+        ...current,
+        items: current.items.filter((_, itemIndex) => itemIndex !== index),
+      };
+    });
   }
 
   async function saveItems(orderId) {
@@ -857,6 +1008,8 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
         size_grams: Number(item.size_grams),
         quantity: Number(item.quantity || 1),
         price_each: Number(item.price_each || 0),
+        bundle_id: item.bundle_id || null,
+        bundle_name: item.bundle_name || null,
       };
     });
 
@@ -882,6 +1035,7 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
         customer_contact: form.customer_contact.trim() || null,
         batch_date: form.batch_date,
         order_type: form.order_type,
+        fulfillment_status: form.fulfillment_status || "Pending",
         amount_paid: Number(form.amount_paid || 0),
         notes: form.notes.trim() || null,
       };
@@ -975,15 +1129,44 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
                 <option>Reseller</option>
               </select>
             </label>
+
+            <label>
+              Prep status
+              <select value={form.fulfillment_status} onChange={(event) => updateField("fulfillment_status", event.target.value)}>
+                <option>Pending</option>
+                <option>Done</option>
+              </select>
+            </label>
           </div>
 
           <div className="items-area">
             <div className="items-title-row">
               <strong>Cookie items</strong>
-              <button type="button" className="secondary-btn small add-item-btn" onClick={addItem} disabled={!activeFlavors.length}>
-                <Plus size={14} />
-                Add item
-              </button>
+              <div className="item-action-buttons">
+                <button
+                  type="button"
+                  className="assorted-box-btn"
+                  onClick={() => addAssortedBox(60)}
+                  disabled={!activeFlavors.length}
+                >
+                  <PackageCheck size={14} />
+                  Assorted 6 × 60g — ₱380
+                </button>
+
+                <button
+                  type="button"
+                  className="assorted-box-btn assorted-box-btn-100"
+                  onClick={() => addAssortedBox(100)}
+                  disabled={!activeFlavors.length}
+                >
+                  <PackageCheck size={14} />
+                  Assorted 6 × 100g — ₱640
+                </button>
+                <button type="button" className="secondary-btn small add-item-btn" onClick={addItem} disabled={!activeFlavors.length}>
+                  <Plus size={14} />
+                  Add item
+                </button>
+              </div>
             </div>
 
             {form.items.map((item, index) => {
@@ -991,7 +1174,7 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
               const availableSizes = getAvailableSizes(selectedFlavor);
 
               return (
-                <div className="item-row" key={`${item.flavor_id}-${index}`}>
+                <div className="item-row" key={`${item.bundle_id || item.flavor_id}-${index}`}>
                   <label>
                     Flavor
                     <select value={item.flavor_id} onChange={(event) => updateItem(index, "flavor_id", event.target.value)}>
@@ -1007,6 +1190,7 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
                     Size
                     <select
                       value={item.size_grams}
+                      disabled={Boolean(item.bundle_id)}
                       onChange={(event) => updateItem(index, "size_grams", Number(event.target.value))}
                     >
                       {[60, 100].map((size) => {
@@ -1028,6 +1212,7 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
                       min="1"
                       step="1"
                       value={item.quantity}
+                      disabled={Boolean(item.bundle_id)}
                       onChange={(event) => updateItem(index, "quantity", event.target.value)}
                     />
                   </label>
@@ -1039,6 +1224,7 @@ function OrderModal({ flavors, orderToEdit, defaultBatchDate, onClose, onSaved }
                       min="0"
                       step="1"
                       value={item.price_each}
+                      disabled={Boolean(item.bundle_id)}
                       onChange={(event) => updateItem(index, "price_each", event.target.value)}
                     />
                   </label>
@@ -1124,7 +1310,7 @@ function ProductionSummary({ summary }) {
       </div>
 
       {summary.length === 0 ? (
-        <div className="empty-state">No items for this filter yet.</div>
+        <div className="empty-state">No pending cookies to bake for this filter.</div>
       ) : (
         <div className="summary-grid">
           {summary.map((row) => (
@@ -1158,6 +1344,16 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
     await onReload();
   }
 
+  async function updatePrepStatus(order, nextStatus) {
+    const { error } = await supabase.from("orders").update({ fulfillment_status: nextStatus }).eq("id", order.id);
+    if (error) {
+      alert(error.message || "Failed to update prep status. Make sure fulfillment_status column exists in Supabase.");
+      return;
+    }
+
+    await onReload();
+  }
+
   async function copySummary(order) {
     const text = buildOrderSummaryText(order, flavors);
 
@@ -1177,7 +1373,7 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
       <div className="panel-title-row">
         <div>
           <p className="eyebrow">Order list</p>
-          <h2>Customers & Payments</h2>
+          <h2>Customers, Payments & Prep</h2>
         </div>
       </div>
 
@@ -1185,64 +1381,99 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
         <div className="empty-state">No orders match your filters.</div>
       ) : (
         <div className="orders-stack">
-          {orders.map((order) => (
-            <article className="order-card" key={order.id}>
-              <div className="order-main">
-                <div>
-                  <div className="customer-line">
-                    <strong>{order.customer_name}</strong>
-                    <span className={`status ${order.computed_status.toLowerCase().replace(" ", "-")}`}>
-                      {order.computed_status === "Paid" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
-                      {order.computed_status}
-                    </span>
+          {orders.map((order) => {
+            const prepStatus = order.computed_prep_status || "Pending";
+            const isDone = prepStatus === "Done";
+
+            return (
+              <article className={`order-card ${isDone ? "order-card-done" : ""}`} key={order.id}>
+                <div className="order-main">
+                  <div>
+                    <div className="customer-line">
+                      <strong>{order.customer_name}</strong>
+                      <div className="order-status-row">
+                        <span className={`status ${order.computed_status.toLowerCase().replace(" ", "-")}`}>
+                          {order.computed_status === "Paid" ? <CheckCircle2 size={13} /> : <AlertTriangle size={13} />}
+                          {order.computed_status}
+                        </span>
+
+                        <span className={`status prep-status ${isDone ? "prep-done" : "prep-pending"}`}>
+                          {isDone ? <CheckCircle2 size={13} /> : <PackageCheck size={13} />}
+                          {isDone ? "Done" : "To bake"}
+                        </span>
+                      </div>
+                    </div>
+                    <p>
+                      {order.batch_date} • {order.order_type}
+                      {order.customer_contact ? ` • ${order.customer_contact}` : ""}
+                    </p>
                   </div>
-                  <p>
-                    {order.batch_date} • {order.order_type}
-                    {order.customer_contact ? ` • ${order.customer_contact}` : ""}
-                  </p>
+
+                  <div className="order-money">
+                    <span>Total: {peso(order.computed_total)}</span>
+                    <span>Paid: {peso(order.computed_paid)}</span>
+                    {order.computed_balance > 0 && <strong>Balance: {peso(order.computed_balance)}</strong>}
+                    {order.computed_change > 0 && <strong className="good">Change: {peso(order.computed_change)}</strong>}
+                  </div>
                 </div>
 
-                <div className="order-money">
-                  <span>Total: {peso(order.computed_total)}</span>
-                  <span>Paid: {peso(order.computed_paid)}</span>
-                  {order.computed_balance > 0 && <strong>Balance: {peso(order.computed_balance)}</strong>}
-                  {order.computed_change > 0 && <strong className="good">Change: {peso(order.computed_change)}</strong>}
+                <div className="order-items">
+                  {groupOrderItemsForDisplay(order, flavors).map((row) => {
+                    if (row.type === "bundle") {
+                      return (
+                        <span className="bundle-summary-line" key={row.key}>
+                          {row.quantity}x {row.name} @ {peso(row.total)}
+                          <small>{row.flavors.join(" • ")}</small>
+                        </span>
+                      );
+                    }
+
+                    const item = row.item;
+                    return (
+                      <span key={row.key}>
+                        {item.quantity}x {getFlavorName(item, flavors)} {item.size_grams}g @ {peso(item.price_each)}
+                      </span>
+                    );
+                  })}
                 </div>
-              </div>
 
-              <div className="order-items">
-                {order.order_items?.map((item) => (
-                  <span key={item.id}>
-                    {item.quantity}x {getFlavorName(item, flavors)} {item.size_grams}g @ {peso(item.price_each)}
-                  </span>
-                ))}
-              </div>
+                {order.notes && <p className="order-notes">{order.notes}</p>}
 
-              {order.notes && <p className="order-notes">{order.notes}</p>}
-
-              <div className="order-actions">
-                <button className="secondary-btn small" type="button" onClick={() => copySummary(order)}>
-                  <ClipboardList size={14} />
-                  {copiedOrderId === order.id ? "Copied!" : "Copy summary"}
-                </button>
-
-                <button className="secondary-btn small" type="button" onClick={() => onEdit(order)}>
-                  <Pencil size={14} />
-                  Edit
-                </button>
-
-                {order.computed_status !== "Paid" && (
-                  <button className="secondary-btn small" type="button" onClick={() => markPaid(order)}>
-                    Mark paid
+                <div className="order-actions">
+                  <button className="secondary-btn small" type="button" onClick={() => copySummary(order)}>
+                    <ClipboardList size={14} />
+                    {copiedOrderId === order.id ? "Copied!" : "Copy summary"}
                   </button>
-                )}
 
-                <button className="icon-btn danger" type="button" onClick={() => deleteOrder(order.id)} aria-label="Delete order">
-                  <Trash2 size={16} />
-                </button>
-              </div>
-            </article>
-          ))}
+                  <button className="secondary-btn small" type="button" onClick={() => onEdit(order)}>
+                    <Pencil size={14} />
+                    Edit
+                  </button>
+
+                  {order.computed_status !== "Paid" && (
+                    <button className="secondary-btn small" type="button" onClick={() => markPaid(order)}>
+                      Mark paid
+                    </button>
+                  )}
+
+                  {isDone ? (
+                    <button className="secondary-btn small prep-reopen-btn" type="button" onClick={() => updatePrepStatus(order, "Pending")}>
+                      Reopen
+                    </button>
+                  ) : (
+                    <button className="secondary-btn small prep-done-btn" type="button" onClick={() => updatePrepStatus(order, "Done")}>
+                      <CheckCircle2 size={14} />
+                      Done
+                    </button>
+                  )}
+
+                  <button className="icon-btn danger" type="button" onClick={() => deleteOrder(order.id)} aria-label="Delete order">
+                    <Trash2 size={16} />
+                  </button>
+                </div>
+              </article>
+            );
+          })}
         </div>
       )}
     </section>
@@ -1250,20 +1481,28 @@ function OrderList({ orders, flavors, onReload, onEdit }) {
 }
 
 function exportCsv(orders, flavors) {
-  const headers = ["Customer", "Batch Date", "Type", "Items", "Total", "Paid", "Balance", "Change", "Status", "Notes"];
+  const headers = ["Customer", "Batch Date", "Type", "Items", "Total", "Paid", "Balance", "Change", "Payment Status", "Prep Status", "Notes"];
 
   const rows = orders.map((order) => [
     order.customer_name,
     order.batch_date,
     order.order_type,
-    (order.order_items || [])
-      .map((item) => `${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g @ ${item.price_each}`)
+    groupOrderItemsForDisplay(order, flavors)
+      .map((row) => {
+        if (row.type === "bundle") {
+          return `${row.quantity}x ${row.name} @ ${row.total} (${row.flavors.join("; ")})`;
+        }
+
+        const item = row.item;
+        return `${item.quantity}x ${getFlavorName(item, flavors)} ${item.size_grams}g @ ${item.price_each}`;
+      })
       .join(" | "),
     order.computed_total,
     order.computed_paid,
     order.computed_balance,
     order.computed_change,
     order.computed_status,
+    order.computed_prep_status || order.fulfillment_status || "Pending",
     order.notes || "",
   ]);
 
@@ -1293,6 +1532,7 @@ function Dashboard({ session }) {
   const [loading, setLoading] = useState(true);
   const [batchDate, setBatchDate] = useState(localDateString());
   const [status, setStatus] = useState("All");
+  const [prepStatus, setPrepStatus] = useState("All");
   const [query, setQuery] = useState("");
   const [isOrderModalOpen, setIsOrderModalOpen] = useState(false);
   const [editingOrder, setEditingOrder] = useState(null);
@@ -1361,6 +1601,7 @@ function Dashboard({ session }) {
     return orders.filter((order) => {
       const matchesDate = batchDate ? order.batch_date === batchDate : true;
       const matchesStatus = status === "All" ? true : order.computed_status === status;
+      const matchesPrepStatus = prepStatus === "All" ? true : (order.computed_prep_status || "Pending") === prepStatus;
 
       const haystack = [
         order.customer_name,
@@ -1375,9 +1616,9 @@ function Dashboard({ session }) {
 
       const matchesSearch = lowerQuery ? haystack.includes(lowerQuery) : true;
 
-      return matchesDate && matchesStatus && matchesSearch;
+      return matchesDate && matchesStatus && matchesPrepStatus && matchesSearch;
     });
-  }, [orders, batchDate, status, query, flavors]);
+  }, [orders, batchDate, status, prepStatus, query, flavors]);
 
   const stats = useMemo(() => {
     return filteredOrders.reduce(
@@ -1387,7 +1628,9 @@ function Dashboard({ session }) {
         acc.paid += order.computed_paid;
         acc.balance += order.computed_balance;
         acc.change += order.computed_change;
-        acc.pieces += (order.order_items || []).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+        if ((order.computed_prep_status || "Pending") !== "Done") {
+          acc.pieces += (order.order_items || []).reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+        }
         return acc;
       },
       {
@@ -1404,8 +1647,10 @@ function Dashboard({ session }) {
   const productionSummary = useMemo(() => {
     const map = new Map();
 
-    filteredOrders.forEach((order) => {
-      (order.order_items || []).forEach((item) => {
+    filteredOrders
+      .filter((order) => (order.computed_prep_status || "Pending") !== "Done")
+      .forEach((order) => {
+        (order.order_items || []).forEach((item) => {
         const flavor = getFlavorName(item, flavors);
         const key = `${flavor}-${item.size_grams}`;
         const current = map.get(key) || {
@@ -1495,13 +1740,22 @@ function Dashboard({ session }) {
           </label>
 
           <label className="filter-field">
-            Status
+            Payment
             <select value={status} onChange={(event) => setStatus(event.target.value)}>
               <option>All</option>
               <option>Paid</option>
               <option>Partial</option>
               <option>Unpaid</option>
               <option>No total</option>
+            </select>
+          </label>
+
+          <label className="filter-field">
+            Prep
+            <select value={prepStatus} onChange={(event) => setPrepStatus(event.target.value)}>
+              <option>All</option>
+              <option>Pending</option>
+              <option>Done</option>
             </select>
           </label>
 
@@ -1527,7 +1781,7 @@ function Dashboard({ session }) {
 
         <section className="stats-grid">
           <StatCard icon={ClipboardList} label="Orders" value={stats.orders} detail="filtered batch" />
-          <StatCard icon={PackageCheck} label="Cookies" value={`${stats.pieces} pcs`} detail="to bake" />
+          <StatCard icon={PackageCheck} label="To Bake" value={`${stats.pieces} pcs`} detail="pending only" />
           <StatCard icon={Banknote} label="Paid" value={peso(stats.paid)} detail={`Sales ${peso(stats.sales)}`} />
           <StatCard icon={AlertTriangle} label="Balance" value={peso(stats.balance)} detail={`Change ${peso(stats.change)}`} />
         </section>
@@ -1556,6 +1810,7 @@ function Dashboard({ session }) {
                 <li>Tap Add Order for every customer.</li>
                 <li>Use Edit if may mali or may dagdag order.</li>
                 <li>Check Cookies to Bake before baking.</li>
+                <li>Tap Done kapag tapos na ang order para mabawas sa To Bake summary.</li>
               </ol>
             </section>
           </div>
@@ -1564,7 +1819,8 @@ function Dashboard({ session }) {
 
       {/* Floating Add Order button - always reachable while scrolling */}
       <button className="fab-add-order" type="button" onClick={openAddOrder} aria-label="Add order">
-        <Plus size={24} />
+        <Plus size={22} />
+        <span>Add Order</span>
       </button>
 
       {isOrderModalOpen && (
